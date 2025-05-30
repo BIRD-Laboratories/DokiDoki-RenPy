@@ -1,286 +1,133 @@
 import json
+import os
+import argparse
 from pptx import Presentation
 from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN
 from pptx.dml.color import RGBColor
-import argparse
-import os
+from pptx.enum.shapes import MSO_SHAPE
 
-class RenPyToPowerPoint:
-    def __init__(self, json_file, output_pptx):
-        self.json_file = json_file
-        self.output_pptx = output_pptx
-        self.presentation = Presentation()
-        self.data = None
-        self.slide_layouts = {
-            'title': 0,
-            'content': 1,
-            'section_header': 2,
-            'two_content': 3,
-            'comparison': 4,
-            'title_only': 5,
-            'blank': 6
-        }
+def create_slideshow(json_file, project_path, output_pptx):
+    # Read JSON data
+    scenes = []
+    with open(json_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            try:
+                data = json.loads(line)
+                # Only include scene data (exclude metadata)
+                if 'dialogue' in data or 'background' in data or 'sprites' in data:
+                    scenes.append(data)
+            except json.JSONDecodeError:
+                continue
+    
+    # Create presentation
+    prs = Presentation()
+    
+    # Slide dimensions
+    slide_width = prs.slide_width
+    slide_height = prs.slide_height
+    
+    # Add title slide
+    title_slide = prs.slides.add_slide(prs.slide_layouts[0])
+    title = title_slide.shapes.title
+    subtitle = title_slide.placeholders[1]
+    
+    title.text = "Ren'Py Visual Novel"
+    subtitle.text = f"Generated from {os.path.basename(project_path)}"
+    
+    # Process each scene
+    for i, scene in enumerate(scenes):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])  # Blank layout
         
-        # Default styling
-        self.title_font_size = Pt(36)
-        self.subtitle_font_size = Pt(24)
-        self.body_font_size = Pt(18)
-        self.character_color = RGBColor(79, 129, 189)  # Blue
-        self.narrator_color = RGBColor(128, 0, 128)    # Purple
-        self.menu_color = RGBColor(34, 139, 34)        # Green
-        self.bg_color = RGBColor(240, 240, 240)        # Light gray
-        self.text_color = RGBColor(0, 0, 0)            # Black
-
-    def load_data(self):
-        """Load the JSON data from the Ren'Py parser"""
-        with open(self.json_file, 'r', encoding='utf-8') as f:
-            self.data = json.load(f)
+        # Add background image if available
+        bg = scene.get('background')
+        if bg:
+            bg_path = os.path.join(project_path, bg)
+            if os.path.exists(bg_path):
+                slide.shapes.add_picture(
+                    bg_path, 0, 0, width=slide_width, height=slide_height
+                )
+        
+        # Add sprites (handling both string and dictionary formats)
+        sprites = scene.get('sprites', {})
+        for pos, sprite in sprites.items():
+            # Handle both string sprite paths and dictionary sprite definitions
+            sprite_image = sprite['image'] if isinstance(sprite, dict) else sprite
+            sprite_path = os.path.join(project_path, sprite_image)
             
-    def create_title_slide(self):
-        """Create the title slide for the presentation"""
-        slide = self.presentation.slides.add_slide(
-            self.presentation.slide_layouts[self.slide_layouts['title']]
-        )
+            if os.path.exists(sprite_path):
+                width = Inches(4)
+                y_pos = slide_height - Inches(5)  # Fixed Y position
+                
+                # Calculate X position based on keyword
+                if 'left' in pos:
+                    x_pos = Inches(0.5)
+                elif 'right' in pos:
+                    x_pos = slide_width - width - Inches(0.5)
+                else:  # center/default
+                    x_pos = (slide_width - width) / 2
+                
+                slide.shapes.add_picture(
+                    sprite_path, 
+                    x_pos, 
+                    y_pos, 
+                    width=width
+                )
         
-        title = slide.shapes.title
-        subtitle = slide.placeholders[1]
-        
-        title.text = "Ren'Py Visual Novel"
-        subtitle.text = "Scene Breakdown Presentation"
-        
-        # Style the title
-        title.text_frame.paragraphs[0].font.size = self.title_font_size
-        title.text_frame.paragraphs[0].font.bold = True
-        
-        # Style the subtitle
-        subtitle.text_frame.paragraphs[0].font.size = self.subtitle_font_size
-
-    def create_overview_slide(self):
-        """Create an overview slide with project statistics"""
-        slide = self.presentation.slides.add_slide(
-            self.presentation.slide_layouts[self.slide_layouts['content']]
-        )
-        
-        title = slide.shapes.title
-        title.text = "Project Overview"
-        
-        content = slide.placeholders[1]
-        tf = content.text_frame
-        
-        # Add project statistics
-        stats = [
-            f"Total Scenes: {len(self.data['scenes'])}",
-            f"Characters: {len(self.data['characters'])}",
-            f"Images: {len(self.data['images'])}",
-            f"Audio Files: {len(self.data['audio'])}"
-        ]
-        
-        for stat in stats:
-            p = tf.add_paragraph()
-            p.text = stat
-            p.font.size = self.body_font_size
-            p.level = 0
-
-    def create_character_slide(self):
-        """Create a slide listing all characters"""
-        if not self.data['characters']:
-            return
-            
-        slide = self.presentation.slides.add_slide(
-            self.presentation.slide_layouts[self.slide_layouts['two_content']]
-        )
-        
-        title = slide.shapes.title
-        title.text = "Characters"
-        
-        left_content = slide.placeholders[1]
-        right_content = slide.placeholders[2]
-        
-        left_tf = left_content.text_frame
-        right_tf = right_content.text_frame
-        
-        # Split characters into two columns
-        char_items = list(self.data['characters'].items())
-        half = len(char_items) // 2
-        
-        for i, (var, name) in enumerate(char_items):
-            tf = left_tf if i < half else right_tf
-            p = tf.add_paragraph()
-            p.text = f"{var}: {name}"
-            p.font.size = self.body_font_size - Pt(2)
-            p.level = 0
-
-    def create_scene_slides(self):
-        """Create slides for each scene"""
-        for i, scene in enumerate(self.data['scenes']):
-            self.create_single_scene_slide(scene, i+1)
-            
-    def create_single_scene_slide(self, scene, scene_num):
-        """Create a slide for a single scene"""
-        slide = self.presentation.slides.add_slide(
-            self.presentation.slide_layouts[self.slide_layouts['title_only']]
-        )
-        
-        # Set slide title with scene number and label path
-        title = slide.shapes.title
-        title.text = f"Scene {scene_num}"
-        
-        # Add label path as subtitle if available
-        if 'label_path' in scene and scene['label_path']:
-            subtitle = slide.placeholders[1]
-            subtitle.text = " → ".join(scene['label_path'])
-            subtitle.text_frame.paragraphs[0].font.size = self.subtitle_font_size - Pt(4)
-            subtitle.text_frame.paragraphs[0].font.italic = True
-        
-        # Create a text box for the content
-        left = Inches(0.5)
-        top = Inches(1.5)
-        width = Inches(9)
-        height = Inches(5)
-        text_box = slide.shapes.add_textbox(left, top, width, height)
-        tf = text_box.text_frame
-        
-        # Add background information if available
-        if scene.get('background'):
-            p = tf.add_paragraph()
-            p.text = f"Background: {scene['background']}"
-            p.font.size = self.body_font_size - Pt(2)
-            p.font.bold = True
-            p.level = 0
-        
-        # Add sprites information if available
-        if scene.get('sprites'):
-            p = tf.add_paragraph()
-            p.text = "Sprites:"
-            p.font.size = self.body_font_size - Pt(2)
-            p.font.bold = True
-            p.level = 0
-            
-            for pos, sprite in scene['sprites'].items():
-                p = tf.add_paragraph()
-                p.text = f"  - {sprite['image']} at {pos}"
-                p.font.size = self.body_font_size - Pt(2)
-                p.level = 1
-        
-        # Add dialogue if available
-        if scene.get('dialogue'):
-            p = tf.add_paragraph()
-            p.text = "Dialogue:"
-            p.font.size = self.body_font_size - Pt(2)
-            p.font.bold = True
-            p.level = 0
-            
-            for line in scene['dialogue']:
-                p = tf.add_paragraph()
-                if line['speaker']:
-                    p.text = f"{line['speaker']}: {line['text']}"
-                    p.font.color = self.character_color
-                else:
-                    p.text = f"Narrator: {line['text']}"
-                    p.font.color = self.narrator_color
-                p.font.size = self.body_font_size - Pt(2)
-                p.level = 1
-        
-        # Add audio if available
-        if scene.get('audio'):
-            p = tf.add_paragraph()
-            p.text = "Audio:"
-            p.font.size = self.body_font_size - Pt(2)
-            p.font.bold = True
-            p.level = 0
-            
-            for audio in scene['audio']:
-                p = tf.add_paragraph()
-                p.text = f"  - {audio}"
-                p.font.size = self.body_font_size - Pt(2)
-                p.level = 1
-        
-        # Add menu choices if available
-        if scene.get('choices'):
-            p = tf.add_paragraph()
-            p.text = "Menu Choices:"
-            p.font.size = self.body_font_size - Pt(2)
-            p.font.bold = True
-            p.font.color = self.menu_color
-            p.level = 0
-            
-            for choice in scene['choices']:
-                p = tf.add_paragraph()
-                p.text = f"  - {choice['text']}"
-                if choice.get('target'):
-                    p.text += f" → {choice['target']}"
-                p.font.size = self.body_font_size - Pt(2)
-                p.font.color = self.menu_color
-                p.level = 1
-
-    def create_assets_slides(self):
-        """Create slides listing all assets"""
-        if self.data['images']:
-            self.create_asset_slide("Images", self.data['images'])
-        if self.data['audio']:
-            self.create_asset_slide("Audio Files", self.data['audio'])
-            
-    def create_asset_slide(self, title, assets):
-        """Create a slide for a specific type of asset"""
-        # Split assets into chunks to avoid too much text on one slide
-        chunk_size = 20
-        for i in range(0, len(assets), chunk_size):
-            slide = self.presentation.slides.add_slide(
-                self.presentation.slide_layouts[self.slide_layouts['two_content']]
+        # Add dialogue box
+        dialogue = scene.get('dialogue', [])
+        if dialogue:
+            # Create rounded rectangle for dialogue box
+            dialogue_box = slide.shapes.add_shape(
+                MSO_SHAPE.ROUNDED_RECTANGLE, 
+                Inches(0.5), 
+                slide_height - Inches(2.5), 
+                slide_width - Inches(1), 
+                Inches(2)
             )
+            # Set background color (semi-transparent black)
+            fill = dialogue_box.fill
+            fill.solid()
+            fill.fore_color.rgb = RGBColor(0, 0, 0)
+            fill.transparency = 0.25
             
-            slide_title = slide.shapes.title
-            slide_title.text = f"{title} (Part {i//chunk_size + 1})"
+            # Set border
+            line = dialogue_box.line
+            line.color.rgb = RGBColor(0, 0, 0)
+            line.width = Pt(1.5)
             
-            left_content = slide.placeholders[1]
-            right_content = slide.placeholders[2]
+            # Configure text frame
+            text_frame = dialogue_box.text_frame
+            text_frame.word_wrap = True
+            text_frame.vertical_anchor = 1  # Middle
             
-            left_tf = left_content.text_frame
-            right_tf = right_content.text_frame
-            
-            chunk = assets[i:i+chunk_size]
-            half = len(chunk) // 2
-            
-            for j, asset in enumerate(chunk):
-                tf = left_tf if j < half else right_tf
-                p = tf.add_paragraph()
-                p.text = asset
-                p.font.size = self.body_font_size - Pt(2)
-                p.level = 0
-
-    def generate_presentation(self):
-        """Generate the complete PowerPoint presentation"""
-        print("Loading JSON data...")
-        self.load_data()
-        
-        print("Creating title slide...")
-        self.create_title_slide()
-        
-        print("Creating overview slide...")
-        self.create_overview_slide()
-        
-        print("Creating character slides...")
-        self.create_character_slide()
-        
-        print(f"Creating {len(self.data['scenes'])} scene slides...")
-        self.create_scene_slides()
-        
-        print("Creating asset slides...")
-        self.create_assets_slides()
-        
-        print(f"Saving presentation to {self.output_pptx}...")
-        self.presentation.save(self.output_pptx)
-        print("Presentation created successfully!")
+            for entry in dialogue:
+                p = text_frame.add_paragraph()
+                if entry.get('speaker'):
+                    p.text = f"{entry['speaker']}: {entry['text']}"
+                else:
+                    p.text = entry['text']
+                p.font.size = Pt(14)
+                p.font.color.rgb = RGBColor(255, 255, 255)  # White text
+                p.alignment = PP_ALIGN.LEFT
+    
+    # Save presentation
+    prs.save(output_pptx)
+    print(f"Created PowerPoint with {len(scenes)} slides at {output_pptx}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert Ren'Py JSON output to PowerPoint")
-    parser.add_argument("json_file", help="Path to JSON file generated by RenPySceneParser")
-    parser.add_argument("output_pptx", help="Output PowerPoint file path (.pptx)")
+    parser.add_argument("json_file", help="JSON file generated by the parser")
+    parser.add_argument("project_path", help="Path to Ren'Py project directory")
+    parser.add_argument("output_pptx", help="Output PowerPoint file path")
     args = parser.parse_args()
-
+    
     if not os.path.exists(args.json_file):
         print(f"Error: JSON file not found at {args.json_file}")
         exit(1)
-
-    converter = RenPyToPowerPoint(args.json_file, args.output_pptx)
-    converter.generate_presentation()
+    
+    if not os.path.exists(args.project_path):
+        print(f"Error: Project directory not found at {args.project_path}")
+        exit(1)
+    
+    create_slideshow(args.json_file, args.project_path, args.output_pptx)
