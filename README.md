@@ -10,6 +10,10 @@ Decompiled sources are provided only for personal use, file analysis in order to
 
 **To view README in Russian, follow [this link](https://github.com/SecondThundeR/DokiDoki-RenPy/blob/your-reality/README_RU.md)**
 
+# DDLC to PPTX
+I saw an interesting instagram repost that reposted a tiktok of someone making DDLC on google slides, I wanted to see if this could be automated. It seems it uses a sprite compositor so I will need to composite staticly and replace the compositing calls to a precomposited image.
+
+
 ## How to use sources
 
 1. In Ren'Py Launcher, create a new project with any name
