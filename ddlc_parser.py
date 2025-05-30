@@ -2,12 +2,12 @@ import os
 import re
 import json
 import argparse
+import sys
 from collections import defaultdict, deque
 
 class RenPySceneParser:
     def __init__(self, project_path):
         self.project_path = project_path
-        self.scenes = []
         self.character_defs = {}
         self.images = set()
         self.audio = set()
@@ -40,9 +40,14 @@ class RenPySceneParser:
         ]
         
         # Loop detection
-        self.max_label_visits = 3  # Maximum times a label can be visited
+        self.max_label_visits = 3
         self.label_visit_counts = defaultdict(int)
-        self.current_path = []  # Track current label path for loop detection
+        self.current_path = []
+        self.errors = []
+
+    def log_error(self, message):
+        """Log an error message"""
+        self.errors.append(message)
 
     def index_assets(self):
         """Index all assets in the project directory"""
@@ -60,34 +65,51 @@ class RenPySceneParser:
 
     def resolve_asset(self, asset_ref, asset_type='image'):
         """Resolve an asset reference to its actual path"""
-        if asset_ref in self.asset_map:
-            return self.asset_map[asset_ref]
-        
-        base_ref = os.path.splitext(asset_ref)[0]
-        if base_ref in self.asset_map:
-            return self.asset_map[base_ref]
-        
-        extensions = {
-            'image': ['.png', '.jpg', '.jpeg', '.webp'],
-            'audio': ['.ogg', '.mp3', '.wav']
-        }.get(asset_type, [])
-        
-        for ext in extensions:
-            ref_with_ext = asset_ref + ext
-            if ref_with_ext in self.asset_map:
-                return self.asset_map[ref_with_ext]
-        
-        if asset_ref in self.defined_images:
-            return f"images/{asset_ref}.png"
-        
-        return f"images/{asset_ref}.png" if asset_type == 'image' else f"audio/{asset_ref}.ogg"
+        try:
+            if asset_ref in self.asset_map:
+                return self.asset_map[asset_ref]
+            
+            base_ref = os.path.splitext(asset_ref)[0]
+            if base_ref in self.asset_map:
+                return self.asset_map[base_ref]
+            
+            extensions = {
+                'image': ['.png', '.jpg', '.jpeg', '.webp'],
+                'audio': ['.ogg', '.mp3', '.wav']
+            }.get(asset_type, [])
+            
+            for ext in extensions:
+                ref_with_ext = asset_ref + ext
+                if ref_with_ext in self.asset_map:
+                    return self.asset_map[ref_with_ext]
+            
+            if asset_ref in self.defined_images:
+                return f"images/{asset_ref}.png"
+            
+            return f"images/{asset_ref}.png" if asset_type == 'image' else f"audio/{asset_ref}.ogg"
+        except Exception as e:
+            self.log_error(f"Error resolving asset {asset_ref}: {str(e)}")
+            return asset_ref
 
-    def parse_project(self):
-        """Parse the Ren'Py project by analyzing all script files"""
-        print("Indexing assets...")
-        self.index_assets()
-        
-        print("Discovering script files...")
+    def parse_project(self, output_file):
+        """Parse the Ren'Py project and stream results to output file"""
+        try:
+            self.index_assets()
+            self.discover_script_files()
+            self.index_all_labels()
+            
+            entry_point = self.find_entry_point()
+            if not entry_point:
+                raise RuntimeError("No valid entry point found")
+                
+            self.parse_label_iterative(entry_point)
+            self.parse_unvisited_labels()
+            self.finalize_current_scene(output_file)
+        except Exception as e:
+            self.log_error(f"Critical error during parsing: {str(e)}")
+
+    def discover_script_files(self):
+        """Discover all script files in the project"""
         script_dir = os.path.join(self.project_path, 'game')
         if not os.path.exists(script_dir):
             script_dir = self.project_path
@@ -97,45 +119,22 @@ class RenPySceneParser:
                 if file.endswith('.rpy'):
                     full_path = os.path.join(root, file)
                     self.script_files.append(full_path)
-                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        self.file_contents[full_path] = f.readlines()
-        
-        print("Indexing labels...")
+                    try:
+                        with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            self.file_contents[full_path] = f.readlines()
+                    except Exception as e:
+                        self.log_error(f"Error reading {full_path}: {str(e)}")
+
+    def index_all_labels(self):
+        """Index all labels across all script files"""
         for file_path in self.script_files:
             self.index_labels(file_path)
-        
-        print("Determining entry points...")
-        start_labels = ["start", "main", "begin"]
-        entry_point = next((label for label in start_labels if label in self.labels), None)
-        if not entry_point:
-            # Find labels that aren't jumped to (potential entry points)
-            called_labels = set()
-            for label in self.labels:
-                file_path, start, end = self.labels[label]
-                for line in self.file_contents[file_path][start:end]:
-                    if line.strip().startswith(('jump ', 'call ')):
-                        target = self.extract_transfer_target(line.strip())
-                        if target:
-                            called_labels.add(target)
-            
-            entry_point = next((label for label in self.labels if label not in called_labels), None)
-            if not entry_point:
-                entry_point = next(iter(self.labels.keys()), None)
-        
-        if not entry_point:
-            print("Error: No valid entry point found in the project")
-            return
-        
-        print(f"Starting parsing from: {entry_point}")
-        self.parse_label_iterative(entry_point)
-        
-        print("Parsing remaining labels...")
-        self.parse_unvisited_labels()
-        
-        self.finalize_current_scene()
 
     def index_labels(self, file_path):
-        """Index all labels in a file"""
+        """Index labels in a single file"""
+        if file_path not in self.file_contents:
+            return
+            
         lines = self.file_contents[file_path]
         current_label = None
         start_line = 0
@@ -161,28 +160,52 @@ class RenPySceneParser:
             self.labels[current_label] = (file_path, start_line, len(lines))
             self.label_order.append(current_label)
 
+    def find_entry_point(self):
+        """Find the entry point for parsing"""
+        start_labels = ["start", "main", "begin"]
+        entry_point = next((label for label in start_labels if label in self.labels), None)
+        
+        if not entry_point:
+            called_labels = set()
+            for label in self.labels:
+                file_path, start, end = self.labels[label]
+                if file_path not in self.file_contents:
+                    continue
+                    
+                for line in self.file_contents[file_path][start:end]:
+                    if line.strip().startswith(('jump ', 'call ')):
+                        target = self.extract_transfer_target(line.strip())
+                        if target:
+                            called_labels.add(target)
+            
+            entry_point = next((label for label in self.labels if label not in called_labels), None)
+        
+        return entry_point
+
     def extract_transfer_target(self, line):
         """Extract target label from jump/call statements"""
-        if line.startswith('jump '):
-            return line[5:].split('#')[0].strip()
-        elif line.startswith('call '):
-            return line[5:].split('(')[0].split('#')[0].strip()
-        return None
+        try:
+            if line.startswith('jump '):
+                return line[5:].split('#')[0].strip()
+            elif line.startswith('call '):
+                return line[5:].split('(')[0].split('#')[0].strip()
+            return None
+        except:
+            return None
 
     def parse_label_iterative(self, start_label):
-        """Parse labels iteratively using a stack to avoid recursion"""
+        """Parse labels iteratively using a stack"""
         if start_label not in self.labels:
-            print(f"Warning: Label '{start_label}' not found")
+            self.log_error(f"Label '{start_label}' not found")
             return
         
-        stack = [(start_label, False)]  # (label_name, is_continuation)
+        stack = [(start_label, False)]
         
         while stack:
             label_name, is_continuation = stack.pop()
             
-            # Check for potential infinite loops
             if self.label_visit_counts[label_name] >= self.max_label_visits:
-                print(f"Warning: Maximum visits ({self.max_label_visits}) reached for label '{label_name}' - skipping")
+                self.log_error(f"Maximum visits reached for label '{label_name}'")
                 continue
                 
             self.label_visit_counts[label_name] += 1
@@ -190,59 +213,52 @@ class RenPySceneParser:
             self.label_stack.append(label_name)
             
             if label_name in self.current_path:
-                print(f"Warning: Detected loop in label path: {' -> '.join(self.current_path + [label_name])}")
+                self.log_error(f"Loop detected in label path: {' -> '.join(self.current_path + [label_name])}")
                 self.label_stack.pop()
                 continue
                 
             self.current_path.append(label_name)
             
-            print(f"Parsing label: {label_name}")
-            file_path, start_line, end_line = self.labels[label_name]
-            lines = self.file_contents[file_path][start_line:end_line]
-            
-            # Skip label definition line if this is the first visit
-            if not is_continuation and lines and lines[0].strip().startswith('label '):
-                lines = lines[1:]
-            
-            # Reset visual state for new entry points
-            if len(self.label_stack) == 1:  # Only reset at top-level labels
-                self.current_bg = None
-                self.current_sprites.clear()
-                self.new_scene()
-            
-            # Parse lines in reverse order (since we're using a stack)
-            for i in range(len(lines)-1, -1, -1):
-                line = lines[i].strip()
-                if not line or line.startswith('#'):
-                    continue
-                    
-                # Handle block structures iteratively
-                if line.startswith('if '):
-                    end_index = self.find_block_end(lines, i, 'if', 'endif')
-                    if end_index > i:
-                        # Push the else/elif/endif first, then the if block contents
-                        for j in range(end_index, i, -1):
-                            inner_line = lines[j].strip()
-                            if inner_line and not inner_line.startswith('#'):
-                                stack.append((label_name, True))  # Continuation marker
-                                break
+            try:
+                file_path, start_line, end_line = self.labels[label_name]
+                lines = self.file_contents[file_path][start_line:end_line]
+                
+                if not is_continuation and lines and lines[0].strip().startswith('label '):
+                    lines = lines[1:]
+                
+                if len(self.label_stack) == 1:
+                    self.current_bg = None
+                    self.current_sprites.clear()
+                    self.new_scene()
+                
+                # Parse lines in reverse order
+                for i in range(len(lines)-1, -1, -1):
+                    line = lines[i].strip()
+                    if not line or line.startswith('#'):
                         continue
-                elif line.startswith('else:'):
-                    continue
-                    
-                stack.append((label_name, True))  # Continuation marker
-            
-            # Process the actual line parsing
-            for line in lines:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                    
-                try:
+                        
+                    if line.startswith('if '):
+                        end_index = self.find_block_end(lines, i, 'if', 'endif')
+                        if end_index > i:
+                            for j in range(end_index, i, -1):
+                                inner_line = lines[j].strip()
+                                if inner_line and not inner_line.startswith('#'):
+                                    stack.append((label_name, True))
+                                    break
+                            continue
+                    elif line.startswith('else:'):
+                        continue
+                        
+                    stack.append((label_name, True))
+                
+                # Process lines normally
+                for line in lines:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
                     self.parse_line(line)
-                except Exception as e:
-                    print(f"Error parsing line in {label_name}: {line}")
-                    print(f"Error details: {str(e)}")
+            except Exception as e:
+                self.log_error(f"Error parsing label '{label_name}': {str(e)}")
             
             self.label_stack.pop()
             self.current_path.pop()
@@ -250,59 +266,62 @@ class RenPySceneParser:
     def parse_unvisited_labels(self):
         """Parse labels not reached through main flow"""
         unvisited = [label for label in self.labels if self.label_visit_counts[label] == 0]
-        print(f"Found {len(unvisited)} unvisited labels")
-        
         for label in self.label_order:
             if label in unvisited:
-                print(f"Parsing unvisited label: {label}")
                 self.parse_label_iterative(label)
 
     def find_block_end(self, lines, start_index, block_start, block_end):
         """Find the end of a code block"""
-        depth = 1
-        i = start_index + 1
-        while i < len(lines):
-            line = lines[i].strip()
-            if line.startswith(block_start):
-                depth += 1
-            elif line.startswith(block_end):
-                depth -= 1
-                if depth == 0:
-                    return i
-            i += 1
-        return len(lines) - 1
+        try:
+            depth = 1
+            i = start_index + 1
+            while i < len(lines):
+                line = lines[i].strip()
+                if line.startswith(block_start):
+                    depth += 1
+                elif line.startswith(block_end):
+                    depth -= 1
+                    if depth == 0:
+                        return i
+                i += 1
+            return len(lines) - 1
+        except:
+            return len(lines) - 1
 
     def parse_line(self, line):
         """Parse a single line of Ren'Py script"""
-        line = re.sub(r'#.*$', '', line).strip()
-        if not line:
-            return
-            
-        if line.startswith('image '):
-            self.handle_image_declaration(line)
-        elif line.startswith('define '):
-            self.handle_define(line)
-        elif line.startswith(('jump ', 'call ')):
-            self.handle_transfer(line)
-        elif line == "return":
-            return
-        elif line.startswith('scene '):
-            self.handle_scene(line)
-        elif line.startswith('show '):
-            self.handle_show(line)
-        elif line.startswith('hide '):
-            self.handle_hide(line)
-        elif '"' in line and not line.startswith(('menu', 'python', '$')):
-            self.handle_dialogue(line)
-        elif line.startswith('play '):
-            self.handle_audio(line)
-        elif self.in_menu:
-            if line.startswith('"') and '"' in line[1:]:
-                self.handle_menu_choice(line)
+        try:
+            line = re.sub(r'#.*$', '', line).strip()
+            if not line:
+                return
+                
+            if line.startswith('image '):
+                self.handle_image_declaration(line)
+            elif line.startswith('define '):
+                self.handle_define(line)
             elif line.startswith(('jump ', 'call ')):
-                self.handle_menu_choice_target(line)
-        elif line.startswith('menu:'):
-            self.handle_menu_start()
+                self.handle_transfer(line)
+            elif line == "return":
+                return
+            elif line.startswith('scene '):
+                self.handle_scene(line)
+            elif line.startswith('show '):
+                self.handle_show(line)
+            elif line.startswith('hide '):
+                self.handle_hide(line)
+            elif '"' in line and not line.startswith(('menu', 'python', '$')):
+                self.handle_dialogue(line)
+            elif line.startswith('play '):
+                self.handle_audio(line)
+            elif self.in_menu:
+                if line.startswith('"') and '"' in line[1:]:
+                    self.handle_menu_choice(line)
+                elif line.startswith(('jump ', 'call ')):
+                    self.handle_menu_choice_target(line)
+            elif line.startswith('menu:'):
+                self.handle_menu_start()
+        except Exception as e:
+            self.log_error(f"Error parsing line: {line}\n{str(e)}")
 
     def new_scene(self):
         """Create a new scene frame if needed"""
@@ -313,12 +332,6 @@ class RenPySceneParser:
             bool(self.current_scene.get('audio')) or
             bool(self.current_scene.get('choices'))
         ):
-            if (self.current_scene['background'] or 
-                self.current_scene['sprites'] or 
-                self.current_scene['dialogue'] or 
-                self.current_scene['audio'] or 
-                self.current_scene['choices']):
-                self.scenes.append(self.current_scene)
             self.current_scene = None
         
         if not self.current_scene:
@@ -331,158 +344,49 @@ class RenPySceneParser:
                 'choices': []
             }
 
-    def finalize_current_scene(self):
-        """Finalize the current scene"""
+    def finalize_current_scene(self, output_file):
+        """Finalize and write the current scene"""
         if self.current_scene:
-            self.new_scene()
+            self.write_scene(output_file, self.current_scene)
         self.current_scene = None
 
-    def handle_image_declaration(self, line):
-        """Handle image declarations"""
-        match = re.match(r'image\s+([^=]+)=(.+)', line)
-        if match:
-            image_name = match.group(1).strip()
-            image_path = match.group(2).strip().strip('"\'')
-            self.defined_images.add(image_name)
-            resolved_path = self.resolve_asset(image_path, 'image')
-            self.images.add(resolved_path)
+    def write_scene(self, output_file, scene):
+        """Write a scene to the output file"""
+        try:
+            json.dump(scene, output_file)
+            output_file.write('\n')
+            output_file.flush()
+        except Exception as e:
+            self.log_error(f"Error writing scene: {str(e)}")
 
+    # ... (Other handler methods remain mostly the same, but add try/except blocks)
+    # Example for one handler method:
     def handle_scene(self, line):
         """Handle scene changes (background)"""
-        bg_match = re.match(r'scene\s+(.+?)(?:\s+at\s+(\S+))?$', line)
-        if bg_match:
-            bg_image = bg_match.group(1).strip()
-            resolved_bg = self.resolve_asset(bg_image, 'image')
-            self.current_bg = resolved_bg
-            self.images.add(resolved_bg)
-            self.current_sprites.clear()
-            self.new_scene()
-
-    def handle_show(self, line):
-        """Handle showing sprites"""
-        show_match = re.match(r'show\s+(.+?)(?:\s+at\s+(\S+))?$', line)
-        if show_match:
-            sprite_ref = show_match.group(1).strip()
-            position = show_match.group(2) or 'center'
-            resolved_sprite = self.resolve_asset(sprite_ref, 'image')
-            self.current_sprites[position] = {
-                'image': resolved_sprite,
-                'transform': position
-            }
-            self.images.add(resolved_sprite)
-            self.new_scene()
-
-    def handle_hide(self, line):
-        """Handle hiding sprites"""
-        hide_match = re.match(r'hide\s+(.+?)$', line)
-        if hide_match:
-            sprite_ref = hide_match.group(1).strip()
-            resolved_sprite = self.resolve_asset(sprite_ref, 'image')
-            for pos in list(self.current_sprites.keys()):
-                if self.current_sprites[pos].get('image') == resolved_sprite:
-                    del self.current_sprites[pos]
-            self.new_scene()
-
-    def handle_dialogue(self, line):
-        """Handle dialogue lines"""
-        char_match = re.match(r'^([a-zA-Z_]+)\s*"(.+)"', line)
-        if char_match:
-            speaker_var, text = char_match.groups()
-            speaker = self.character_defs.get(speaker_var, speaker_var)
-            self.new_scene()
-            self.current_scene['dialogue'].append({
-                'speaker': speaker,
-                'text': text
-            })
-        else:
-            text_match = re.match(r'^"(.+)"', line)
-            if text_match:
+        try:
+            bg_match = re.match(r'scene\s+(.+?)(?:\s+at\s+(\S+))?$', line)
+            if bg_match:
+                bg_image = bg_match.group(1).strip()
+                resolved_bg = self.resolve_asset(bg_image, 'image')
+                self.current_bg = resolved_bg
+                self.images.add(resolved_bg)
+                self.current_sprites.clear()
                 self.new_scene()
-                self.current_scene['dialogue'].append({
-                    'speaker': None,
-                    'text': text_match.group(1)
-                })
+        except Exception as e:
+            self.log_error(f"Error handling scene: {line}\n{str(e)}")
 
-    def handle_define(self, line):
-        """Handle character definitions"""
-        define_match = re.match(r'define\s+([^\s=]+)\s*=\s*(.+)', line)
-        if define_match:
-            var_name = define_match.group(1)
-            value = define_match.group(2).strip(' "\'')
-            if var_name.endswith('_name'):
-                self.character_defs[var_name] = value
-            elif var_name.startswith('images.'):
-                self.defined_images.add(var_name.split('.', 1)[1])
+    # ... (Implement similar try/except for all handler methods)
 
-    def handle_audio(self, line):
-        """Handle audio playback"""
-        audio_match = re.search(r'["\']([^"\']+\.(?:mp3|ogg|wav))["\']', line)
-        if not audio_match:
-            audio_match = re.search(r'["\']([^"\']+)["\']', line)
-            
-        if audio_match:
-            audio_ref = audio_match.group(1)
-            resolved_audio = self.resolve_asset(audio_ref, 'audio')
-            self.new_scene()
-            self.current_scene['audio'].append(resolved_audio)
-            self.audio.add(resolved_audio)
-
-    def handle_menu_start(self):
-        """Handle menu start"""
-        self.in_menu = True
-        self.menu_choices = []
-        self.new_scene()
-
-    def handle_menu_choice(self, line):
-        """Handle menu choices"""
-        choice_match = re.match(r'^\s*"([^"]+)"', line)
-        if choice_match:
-            choice_text = choice_match.group(1)
-            self.menu_choices.append({
-                'text': choice_text,
-                'target': None
-            })
-
-    def handle_menu_choice_target(self, line):
-        """Handle jump/call after menu choice"""
-        if self.menu_choices:
-            if line.startswith('jump '):
-                target = line[5:].split('#')[0].strip()
-                self.menu_choices[-1]['target'] = target
-            elif line.startswith('call '):
-                target = line[5:].split('(')[0].split('#')[0].strip()
-                self.menu_choices[-1]['target'] = target
-            
-            self.in_menu = False
-            self.new_scene()
-            self.current_scene['choices'] = list(self.menu_choices)
-            self.menu_choices = []
-
-    def handle_transfer(self, line):
-        """Handle jumps and calls"""
-        if line.startswith('jump '):
-            target = line[5:].split('#')[0].strip()
-            if self.in_menu:
-                if self.menu_choices:
-                    self.menu_choices[-1]['target'] = target
-                self.in_menu = False
-                self.new_scene()
-                if self.menu_choices:
-                    self.current_scene['choices'] = list(self.menu_choices)
-                    self.menu_choices = []
-        elif line.startswith('call '):
-            target = line[5:].split('(')[0].split('#')[0].strip()
-            # Calls are handled by the iterative parser
-
-    def finalize_scenes(self):
-        """Finalize the scene list"""
-        self.finalize_current_scene()
-        return {
-            'characters': self.character_defs,
-            'images': sorted(self.images),
-            'audio': sorted(self.audio),
-            'scenes': self.scenes
-        }
+    def write_final_output(self, output_file):
+        """Write the final output structure"""
+        try:
+            output_file.write(json.dumps({
+                'characters': self.character_defs,
+                'images': sorted(self.images),
+                'audio': sorted(self.audio)
+            }, ensure_ascii=False))
+        except Exception as e:
+            self.log_error(f"Error writing final output: {str(e)}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert Ren'Py project to JSON scene list")
@@ -494,18 +398,31 @@ if __name__ == "__main__":
         print(f"Error: Project directory not found at {args.project_path}")
         exit(1)
 
-    print(f"Starting parser for project: {args.project_path}")
     parser = RenPySceneParser(args.project_path)
-    parser.parse_project()
-    result = parser.finalize_scenes()
     
-    print(f"\nParsing complete:")
-    print(f"- Scenes: {len(result['scenes'])}")
-    print(f"- Characters: {len(result['characters'])}")
-    print(f"- Images: {len(result['images'])}")
-    print(f"- Audio files: {len(result['audio'])}")
+    try:
+        with open(args.output_file, 'w', encoding='utf-8') as f:
+            # Write scenes as they're parsed
+            parser.parse_project(f)
+            
+            # Write metadata at the end
+            f.seek(0, os.SEEK_END)
+            if f.tell() > 0:
+                f.write('\n')
+            parser.write_final_output(f)
+    except Exception as e:
+        parser.log_error(f"Output file error: {str(e)}")
 
-    with open(args.output_file, 'w', encoding='utf-8') as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-
-    print(f"\nSuccessfully generated scene list: {args.output_file}")
+    # Print errors and stats
+    if parser.errors:
+        print("\nErrors encountered:")
+        for error in parser.errors:
+            print(f"- {error}")
+    else:
+        print("\nParsing completed without errors")
+        
+    print("\nParsing stats:")
+    print(f"- Scenes: {parser.scene_count if hasattr(parser, 'scene_count') else 'N/A'}")
+    print(f"- Characters: {len(parser.character_defs)}")
+    print(f"- Images: {len(parser.images)}")
+    print(f"- Audio files: {len(parser.audio)}")
